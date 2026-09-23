@@ -213,6 +213,7 @@ Keep credentials out of Git; `.env` and local runtime data are ignored.
 cd /workspaces/gaming-leaderboard
 source .venv/bin/activate
 ruff check .
+mkdir -p .pytest_cache
 pytest --basetemp=.pytest_cache/test-tmp
 ```
 
@@ -228,10 +229,9 @@ checks use dedicated Redis processes for outages, timeouts, recovery, and a norm
 restart with AOF persistence; these do not establish crash durability or verify a Docker
 deployment. Redis must be installed locally even when the API is run with Compose.
 
-GitHub Actions is configured to install Python dependencies, lint, and run pytest.
-Its runner must provide `redis-server`; verify the workflow's Redis installation and
-actual successful run before submission. Local test success alone does not prove CI
-or the Compose deployment has passed.
+GitHub Actions explicitly installs Redis and the Python dependencies, then runs lint and
+the same pytest command shown above. Check the actual workflow result before submission;
+local test success alone does not prove CI or the Compose deployment has passed.
 
 ## Project layout and architecture
 
