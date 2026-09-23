@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from leaderboard.models import (
     ContextResponse,
@@ -9,11 +9,17 @@ from leaderboard.models import (
     ScoreResponse,
     ScoreSubmission,
 )
+from leaderboard.security import require_submission_key
 
 router = APIRouter(prefix="/games", tags=["leaderboard"])
 
 
-@router.post("/{game_id}/scores", response_model=ScoreResponse)
+@router.post(
+    "/{game_id}/scores",
+    response_model=ScoreResponse,
+    dependencies=[Depends(require_submission_key)],
+    responses={401: {"description": "Invalid or missing submission API key"}},
+)
 async def submit_score(
     game_id: Identifier, submission: ScoreSubmission, request: Request
 ) -> ScoreResponse:

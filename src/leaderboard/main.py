@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
+    if settings.submission_api_key is None:
+        raise RuntimeError(
+            "Set LEADERBOARD_SUBMISSION_API_KEY to a random secret of at least 32 characters."
+        )
     redis = Redis.from_url(
         settings.redis_url,
         decode_responses=True,

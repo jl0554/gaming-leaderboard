@@ -3,6 +3,7 @@ services:
     build: .
     environment:
       LEADERBOARD_ENVIRONMENT: development
+      LEADERBOARD_SUBMISSION_API_KEY: "${LEADERBOARD_SUBMISSION_API_KEY:?Set LEADERBOARD_SUBMISSION_API_KEY in .env or environment}"
       LEADERBOARD_REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"

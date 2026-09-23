@@ -1,15 +1,19 @@
 # Leaderboard architecture
 
 The implemented service is one FastAPI application using Redis as its leaderboard source
-of truth. Each game's sorted set stores one best score per player. Authentication,
-rate limiting, load balancing, metrics export, replication, and failover are future work.
+of truth. Each game's sorted set stores one best score per player. Score submissions
+require a trusted-server API key; reads remain public. Rate limiting, load balancing,
+metrics export, replication, and failover are future work.
 
 ## Current request and data flow
 
 ```mermaid
 flowchart LR
     Caller[API caller] -->|HTTP JSON| API[FastAPI routes]
-    API --> Validation[Input validation]
+    API -->|Score submission| Auth[X-API-Key check]
+    Auth -->|Valid key| Validation[Input validation]
+    Auth -->|Missing or wrong key| Unauthorized[401 Unauthorized]
+    API -->|Public reads| Validation
     Validation -->|Valid request| Store[LeaderboardStore]
     Validation -->|Invalid request| Invalid[422 validation response]
     Store -->|Submit: atomic Lua update and rank| Redis[(Redis sorted sets)]
@@ -52,8 +56,9 @@ blocks other commands for its duration.
 
 ### Submit a score
 
-`POST /games/{game_id}/scores` accepts a player ID and strict integer score.
-After validation, one Redis script:
+`POST /games/{game_id}/scores` accepts a player ID and strict integer score. It requires
+an `X-API-Key` header matching the configured submission key. After authentication and
+input validation, one Redis script:
 
 1. Uses `ZADD LT CH` with the negative score. New players are inserted; existing players
    change only when the new stored score is smaller, meaning the public score is higher.
@@ -93,6 +98,21 @@ All reads within the script describe one state, even while other clients submit 
 
 Each request has its own consistent result. Two separate HTTP requests may legitimately
 observe different ranks after an intervening update.
+
+## Authentication boundary
+
+`LEADERBOARD_SUBMISSION_API_KEY` is required at API startup, with no default or bypass.
+It must contain 32–256 printable ASCII characters without whitespace; generate a random value and
+keep it in the environment or ignored local `.env`. Compose requires and passes this
+setting. POST score submissions require `X-API-Key`; missing or incorrect credentials
+return `401` with `{"detail":"Invalid or missing API key"}` before storage is accessed.
+All leaderboard/context GETs, health checks, documentation, and the OpenAPI schema remain
+public. Swagger UI exposes the `ScoreSubmissionKey` authorization scheme.
+
+The key authenticates a trusted submitting server, not an individual player. Any holder
+can write scores for any game/player; per-game permissions and anti-cheat validation are
+not implemented. Use HTTPS outside localhost, keep the key out of logs, and rotate it by
+updating configuration and restarting the API and updating submitting clients.
 
 ## Errors and operational behavior
 
@@ -152,7 +172,6 @@ exercise actual outages/timeouts, recovery, and normal restart with AOF enabled.
 
 The current implementation still needs operational deployment verification. Prioritize
 an accurate GitHub submission and a passing CI run. Further production work includes
-trusted-server authentication for score submissions, rate limits, TLS, backups, memory
-monitoring, metrics, and an explicit replication/failover policy. An API credential alone
-would not validate whether a player earned a submitted score; anti-cheat validation belongs
-in trusted game logic.
+rate limits, TLS, backups, memory monitoring, metrics, per-game submission permissions,
+and an explicit replication/failover policy. The submission API key does not validate
+whether a player earned a score; anti-cheat validation belongs in trusted game logic.

@@ -21,6 +21,9 @@ from redis.retry import Retry
 from leaderboard.config import Settings
 from leaderboard.main import create_app
 
+# Deliberately public fixture data; never a production credential.
+FAKE_API_KEY = "test-only-submission-key-not-a-real-secret-0123456789"
+
 
 class OwnedRedis:
     """A process and files owned by one test; never connect to shared Redis."""
@@ -115,13 +118,14 @@ def resilience_client(owned_redis: OwnedRedis) -> Iterator[TestClient]:
     application = create_app(
         Settings(
             _env_file=None,
+            submission_api_key=FAKE_API_KEY,
             redis_url=owned_redis.url,
             redis_key_prefix=f"resilience-{uuid4().hex}",
             redis_socket_timeout=0.15,
             redis_connect_timeout=0.15,
         )
     )
-    with TestClient(application) as client:
+    with TestClient(application, headers={"X-API-Key": FAKE_API_KEY}) as client:
         yield client
 
 

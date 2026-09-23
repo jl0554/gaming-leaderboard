@@ -46,6 +46,24 @@ cp -n .env.example .env
 mkdir -p .runtime/redis
 ```
 
+Generate a unique submission key into your local `.env` without printing it. This preserves
+an existing key. The API will not start without a valid key; there is no default or bypass.
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+import secrets
+
+env = Path(".env")
+env.chmod(0o600)
+text = env.read_text()
+if not any(line.lstrip().startswith("LEADERBOARD_SUBMISSION_API_KEY=")
+           for line in text.splitlines()):
+    with env.open("a") as output:
+        output.write("\nLEADERBOARD_SUBMISSION_API_KEY=" + secrets.token_urlsafe(32) + "\n")
+PY
+```
+
 Start Redis in a dedicated terminal, using a free local port. This example uses 6379:
 
 ```sh
@@ -66,13 +84,15 @@ source .venv/bin/activate
 uvicorn leaderboard.main:app --reload
 ```
 
-Open [interactive API documentation](http://localhost:8000/docs), or use the examples below.
-Check the process with `GET /health/live`; `GET /health/ready` also checks Redis.
+Open [interactive API documentation](http://localhost:8000/docs). Use **Authorize**, select
+`ScoreSubmissionKey`, and enter your local key to submit scores through Swagger UI.
+The documentation itself and all GET endpoints remain public. Check the process with `GET /health/live`; `GET /health/ready` also checks Redis.
 Stop foreground processes with Ctrl+C. Preserve `.runtime/redis` when restarting Redis.
 
 ## Run with Docker Compose
 
-From the project directory, with a working Docker daemon:
+Complete the `.env` and key-generation steps above first. From the project directory,
+with a working Docker daemon:
 
 ```sh
 docker compose up --build
@@ -85,21 +105,45 @@ local Redis process. Avoid running both API launch methods on port 8000 at once.
 
 Use `docker compose down` to stop the stack while retaining its data volume.
 `docker compose down -v` deletes that volume and its leaderboard data.
-The development API currently accepts score submissions without authentication.
+Compose requires `LEADERBOARD_SUBMISSION_API_KEY` in `.env` or the environment and passes
+it to the API. A missing value prevents Compose startup.
+
+## Score submission authentication
+
+`POST /games/{game_id}/scores` requires the `X-API-Key` header. A missing or incorrect key
+returns `401` with `{"detail":"Invalid or missing API key"}`. Leaderboard/context GETs,
+health checks, `/docs`, and `/openapi.json` remain public.
+
+The configured key must contain 32–256 printable ASCII characters with no whitespace; the generator
+above creates a suitable random value. Keep `.env` and the key out of Git and application
+logs. A key identifies a trusted game server: anyone holding it can submit scores for any
+player in any game. It does not establish player identity or prove scores were earned.
+Use HTTPS outside localhost. Rotate the key by replacing its configured value and
+restarting the API; all submitting clients must then use the new key.
 
 ## API examples
 
 Use a fresh game ID for a clean demonstration. Submitting these same scores again keeps
 these players' best scores unchanged. `curl -i` displays the HTTP status as well as JSON.
 
+In the terminal used for these requests, load your locally created `.env` from the project
+directory. It contains the generated key; this command does not print it:
+
+```sh
+. ./.env
+```
+
 Submit three players, including a tie:
 
 ```sh
 curl -i -X POST http://localhost:8000/games/demo-shared-ranks/scores \
+  -H "X-API-Key: $LEADERBOARD_SUBMISSION_API_KEY" \
   -H 'Content-Type: application/json' -d '{"user_id":"alice","score":100}'
 curl -i -X POST http://localhost:8000/games/demo-shared-ranks/scores \
+  -H "X-API-Key: $LEADERBOARD_SUBMISSION_API_KEY" \
   -H 'Content-Type: application/json' -d '{"user_id":"bob","score":100}'
 curl -i -X POST http://localhost:8000/games/demo-shared-ranks/scores \
+  -H "X-API-Key: $LEADERBOARD_SUBMISSION_API_KEY" \
   -H 'Content-Type: application/json' -d '{"user_id":"carol","score":90}'
 ```
 
@@ -176,6 +220,7 @@ neighbor arrays. A player without a score in that game returns `404`.
 
 ## Validation and errors
 
+- Score submission requires a valid `X-API-Key`; missing/incorrect keys return `401`.
 - Game and player IDs contain 1–64 ASCII letters, digits, underscores, or hyphens.
 - Scores are strict integers from 0 through 1,000,000,000. Booleans, numeric strings,
   fractions, nonfinite numbers, and out-of-range scores are rejected.
@@ -196,6 +241,8 @@ after storage recovers. Highest-score semantics prevent a retry from awarding ex
 
 Settings load from environment variables or `.env`:
 
+- `LEADERBOARD_SUBMISSION_API_KEY`: required, with no default; 32–256 printable ASCII
+  characters without whitespace. Missing or invalid configuration prevents API startup.
 - `LEADERBOARD_REDIS_URL`: default `redis://localhost:6379/0`.
 - `LEADERBOARD_REDIS_KEY_PREFIX`: default `leaderboard`; change it to isolate deployments.
 - `LEADERBOARD_REDIS_CONNECT_TIMEOUT`: default 2 seconds.
@@ -217,6 +264,7 @@ mkdir -p .pytest_cache
 pytest --basetemp=.pytest_cache/test-tmp
 ```
 
+Tests provide their own fake API keys; CI does not need a production key or GitHub secret.
 The leaderboard integration tests launch their own real Redis process on an available
 loopback port. They do not require the development Redis server to be running. Each test
 uses isolated keys; cleanup deletes only its keys, never an existing Redis database.

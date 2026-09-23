@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
@@ -19,6 +20,9 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from leaderboard.config import Settings
 from leaderboard.main import create_app
+
+# Deliberately public fixture data; never a production credential.
+FAKE_API_KEY = "test-only-submission-key-not-a-real-secret-0123456789"
 
 
 @pytest.fixture(scope="session")
@@ -83,6 +87,7 @@ def client(redis_url: str) -> Iterator[TestClient]:
     application = create_app(
         Settings(
             _env_file=None,
+            submission_api_key=FAKE_API_KEY,
             redis_url=redis_url,
             redis_key_prefix=prefix,
             redis_socket_timeout=0.5,
@@ -90,7 +95,7 @@ def client(redis_url: str) -> Iterator[TestClient]:
         )
     )
     try:
-        with TestClient(application) as test_client:
+        with TestClient(application, headers={"X-API-Key": FAKE_API_KEY}) as test_client:
             yield test_client
     finally:
         with Redis.from_url(redis_url, socket_timeout=1) as cleanup:
@@ -401,3 +406,151 @@ def test_extreme_numeric_scores_return_safe_validation_errors(
     assert errors[0]["loc"] == ["body", "score"]
     assert all(set(error) == {"type", "loc", "msg"} for error in errors)
     assert client.get("/games/chess/leaderboard").json()["entries"] == []
+
+
+@pytest.mark.parametrize(
+    "provided_key",
+    [
+        None,
+        "",
+        "wrong-test-key-not-a-real-secret-0123456789",
+        FAKE_API_KEY.upper(),
+        " " + FAKE_API_KEY,
+        FAKE_API_KEY + " ",
+        "é".encode() * 32,
+    ],
+)
+def test_auth_rejects_invalid_keys_before_storage_and_preserves_scores(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, provided_key: str | bytes | None
+) -> None:
+    submit(client, "alice", 100)
+    client.headers.pop("X-API-Key")
+    headers = {} if provided_key is None else {"X-API-Key": provided_key}
+    unexpected_storage = AsyncMock(side_effect=AssertionError("Unauthorized storage access"))
+    with monkeypatch.context() as patch:
+        patch.setattr(client.app.state.redis, "execute_command", unexpected_storage)
+        response = client.post(
+            "/games/chess/scores", headers=headers, json={"user_id": "alice", "score": 999}
+        )
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Invalid or missing API key"}
+        unexpected_storage.assert_not_called()
+    assert FAKE_API_KEY not in response.text
+    assert client.get("/games/chess/leaderboard").json()["entries"] == [entry("alice", 100, 1)]
+
+
+@pytest.mark.parametrize("query_name", ["api_key", "X-API-Key"])
+def test_auth_does_not_accept_key_in_query(client: TestClient, query_name: str) -> None:
+    client.headers.pop("X-API-Key")
+    response = client.post(
+        "/games/chess/scores",
+        params={query_name: FAKE_API_KEY},
+        json={"user_id": "alice", "score": 100},
+    )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid or missing API key"}
+    assert client.get("/games/chess/leaderboard").json()["entries"] == []
+
+
+def test_valid_api_key_keeps_best_score_semantics(client: TestClient) -> None:
+    client.headers.pop("X-API-Key")
+    for score, expected_score, updated in [(100, 100, True), (50, 100, False), (150, 150, True)]:
+        response = client.post(
+            "/games/chess/scores",
+            headers={"X-API-Key": FAKE_API_KEY},
+            json={"user_id": "alice", "score": score},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "game_id": "chess",
+            "user_id": "alice",
+            "score": expected_score,
+            "rank": 1,
+            "updated": updated,
+        }
+        assert FAKE_API_KEY not in response.text
+
+
+@pytest.mark.parametrize("unneeded_header", [None, "invalid-key"])
+def test_reads_health_and_documentation_are_public(
+    client: TestClient, unneeded_header: str | None
+) -> None:
+    submit(client, "alice", 100)
+    client.headers.pop("X-API-Key")
+    headers = {} if unneeded_header is None else {"X-API-Key": unneeded_header}
+    for path in [
+        "/games/chess/leaderboard",
+        "/games/chess/players/alice/context",
+        "/health/live",
+        "/health/ready",
+        "/docs",
+        "/openapi.json",
+    ]:
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200, (path, response.text)
+        assert FAKE_API_KEY not in response.text
+
+
+def test_openapi_requires_key_only_for_score_submission(client: TestClient) -> None:
+    client.headers.pop("X-API-Key")
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    assert FAKE_API_KEY not in response.text
+    schema = response.json()
+    scheme = schema["components"]["securitySchemes"]["ScoreSubmissionKey"]
+    assert scheme["type"] == "apiKey"
+    assert scheme["in"] == "header"
+    assert scheme["name"] == "X-API-Key"
+    assert not schema.get("security")
+    assert schema["paths"]["/games/{game_id}/scores"]["post"]["security"] == [
+        {"ScoreSubmissionKey": []}
+    ]
+    for methods in schema["paths"].values():
+        for method, operation in methods.items():
+            if method == "get":
+                assert not operation.get("security")
+
+
+def test_missing_submission_key_prevents_startup() -> None:
+    application = create_app(Settings(_env_file=None, submission_api_key=None))
+    with (
+        pytest.raises(RuntimeError, match="LEADERBOARD_SUBMISSION_API_KEY"),
+        TestClient(application),
+    ):
+        pytest.fail("The API must not start without a configured submission key.")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "",
+        "short",
+        "x" * 31,
+        "x" * 257,
+        " " * 32,
+        "x" * 32 + " ",
+        "x" * 16 + "\t" + "x" * 16,
+        "x" * 16 + "\n" + "x" * 16,
+        "é" * 32,
+    ],
+)
+def test_invalid_submission_key_configuration_is_rejected(key: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, submission_api_key=key)
+
+
+@pytest.mark.parametrize("length", [32, 256])
+def test_submission_key_length_boundaries_and_secret_redaction(length: int) -> None:
+    key = "k" * length
+    settings = Settings(_env_file=None, submission_api_key=key)
+    assert settings.submission_api_key.get_secret_value() == key
+    assert key not in repr(settings)
+    assert key not in str(settings)
+    assert key not in settings.model_dump_json()
+
+
+def test_invalid_submission_key_is_not_exposed_in_configuration_error() -> None:
+    invalid_key = FAKE_API_KEY + " "
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None, submission_api_key=invalid_key)
+    assert FAKE_API_KEY not in str(error.value)
