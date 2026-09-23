@@ -4,12 +4,20 @@ services:
     environment:
       LEADERBOARD_ENVIRONMENT: development
       LEADERBOARD_SUBMISSION_API_KEY: "${LEADERBOARD_SUBMISSION_API_KEY:?Set LEADERBOARD_SUBMISSION_API_KEY in .env or environment}"
+      # Empty default leaves metrics disabled. Use a distinct monitoring credential.
+      LEADERBOARD_METRICS_API_KEY: "${LEADERBOARD_METRICS_API_KEY:-}"
       LEADERBOARD_REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 12
 
   redis:
     image: redis:7.4-alpine

@@ -2,14 +2,20 @@
 
 The implemented service is one FastAPI application using Redis as its leaderboard source
 of truth. Each game's sorted set stores one best score per player. Score submissions
-require a trusted-server API key; reads remain public. Rate limiting, load balancing,
-metrics export, replication, and failover are future work.
+require a trusted-server API key; leaderboard reads remain public. Request tracing,
+structured logs, protected metrics export, and a locked-dependency Docker smoke test are
+implemented. Rate limiting, load balancing, replication, and failover are future work.
 
 ## Current request and data flow
 
 ```mermaid
 flowchart LR
-    Caller[API caller] -->|HTTP JSON| API[FastAPI routes]
+    Caller[API caller] -->|HTTP JSON| Instrumentation[Request ID and timing middleware]
+    Instrumentation --> API[FastAPI routes]
+    Instrumentation -.-> RequestLog[Safe JSON request logs]
+    Instrumentation -.-> Counters[Per-process counters and histograms]
+    Monitor[Monitoring client] -->|X-Metrics-Key| Metrics[Protected metrics endpoint]
+    Metrics --> Counters
     API -->|Score submission| Auth[X-API-Key check]
     Auth -->|Valid key| Validation[Input validation]
     Auth -->|Missing or wrong key| Unauthorized[401 Unauthorized]
@@ -24,13 +30,15 @@ flowchart LR
     Response --> Caller
     Store -->|Missing player| Missing[404 PLAYER_NOT_RANKED]
     Store -->|Redis failure| Unavailable[503 REDIS_UNAVAILABLE]
-    Unavailable -.-> Log[Warning log with error type only]
+    Unavailable -.-> Log[Categorized safe error log and counter]
     Redis -->|When AOF is enabled| AOF[(Append-only log on persistent storage)]
 ```
 
 The diagram shows the existing local service. HTTP uses Uvicorn locally; TLS termination
-and a load balancer are not part of the current deployment. The API has storage-failure
-warning logs and Uvicorn's standard access logs, not a metrics/observability pipeline.
+and a load balancer are not part of the current deployment.
+The API has structured request/error logs and a protected Prometheus-compatible metrics
+endpoint. No external collector, dashboard, or alerts are deployed. The launch command
+disables Uvicorn's raw access logs to avoid recording user-controlled URLs and queries.
 
 ## Data representation and ranking
 
@@ -107,7 +115,9 @@ keep it in the environment or ignored local `.env`. Compose requires and passes 
 setting. POST score submissions require `X-API-Key`; missing or incorrect credentials
 return `401` with `{"detail":"Invalid or missing API key"}` before storage is accessed.
 All leaderboard/context GETs, health checks, documentation, and the OpenAPI schema remain
-public. Swagger UI exposes the `ScoreSubmissionKey` authorization scheme.
+public. `/metrics` is disabled without a separate monitoring key and requires `X-Metrics-Key`
+when enabled. Configuration rejects monitoring credentials equal to score-writing credentials.
+Swagger UI exposes the `ScoreSubmissionKey` authorization scheme.
 
 The key authenticates a trusted submitting server, not an individual player. Any holder
 can write scores for any game/player; per-game permissions and anti-cheat validation are
@@ -120,6 +130,16 @@ Validation rejects invalid IDs, scores, and query bounds before calling storage.
 input returns `422` with JSON-safe validation details; raw input is not echoed. A missing
 player returns `404 PLAYER_NOT_RANKED`. Redis failures in leaderboard operations return
 `503 REDIS_UNAVAILABLE`, with a generic message and no connection credentials or traceback.
+Diagnostics classify Redis failures as connection, timeout, authentication, response, or
+other without exposing exception messages. Unexpected application errors return generic
+500 `INTERNAL_ERROR` responses; their logs contain only the exception type and request ID.
+
+Each response carries a freshly generated `X-Request-ID`. JSON request logs correlate that
+ID with method, route template, status, and duration. They never include request bodies,
+headers, query strings, raw paths, or actual game/player IDs. Metrics aggregate request
+counts, latency, and Redis failures using bounded labels; request IDs are never labels.
+Metrics scrapes are excluded. Registries are per application/process: use a single worker
+per container and scrape each replica independently. Metrics reset on process restart.
 
 The application creates an asynchronous Redis client at startup and closes it during
 shutdown. Connection and socket timeouts default to 2 seconds; both are configurable.
@@ -170,8 +190,14 @@ updates, shared ranks, tie cutoffs, mid-tie context windows, boundaries, input v
 game isolation, concurrent submissions, and safe failure responses. Resilience checks
 exercise actual outages/timeouts, recovery, and normal restart with AOF enabled.
 
-The current implementation still needs operational deployment verification. Prioritize
-an accurate GitHub submission and a passing CI run. Further production work includes
-rate limits, TLS, backups, memory monitoring, metrics, per-game submission permissions,
-and an explicit replication/failover policy. The submission API key does not validate
-whether a player earned a score; anti-cheat validation belongs in trusted game logic.
+CI installs from `uv.lock` with `--locked`, runs lint/pytest, then builds the application
+image and smoke-tests it against a disposable Redis over HTTP. The smoke check covers
+readiness, authentication, best scores, ties, context, request IDs, and protected metrics.
+It is not a live production deployment, load test, or backup-restore exercise.
+
+Further production work includes gateway rate/body limits, bounded connection capacity,
+TLS, private Redis access controls, off-host backups with a restore exercise, memory
+monitoring, dashboards/alerts, per-game submission permissions when needed, and an explicit
+replication/failover policy. Choose load targets and acceptable data-loss/recovery windows
+before selecting infrastructure. The submission API key does not validate whether a
+player earned a score; anti-cheat validation belongs in trusted game logic.

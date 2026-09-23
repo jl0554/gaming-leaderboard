@@ -1,4 +1,3 @@
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,13 +12,13 @@ from redis.exceptions import RedisError
 from leaderboard.api.leaderboard import router as leaderboard_router
 from leaderboard.api.system import router as system_router
 from leaderboard.config import Settings, get_settings
+from leaderboard.observability import Observability, ObservabilityMiddleware, configure_logging
 from leaderboard.storage import LeaderboardStore, PlayerNotRankedError
-
-logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    configure_logging()
     settings = app.state.settings
     if settings.submission_api_key is None:
         raise RuntimeError(
@@ -62,8 +61,7 @@ async def player_not_ranked_handler(request: Request, exc: PlayerNotRankedError)
 
 
 async def redis_error_handler(request: Request, exc: RedisError) -> JSONResponse:
-    # Log the error type only: connection exceptions can contain credentials.
-    logger.warning("Leaderboard storage failure: %s", type(exc).__name__)
+    request.app.state.observability.record_redis_error(request.scope, exc, operation="leaderboard")
     return JSONResponse(
         status_code=503,
         content={
@@ -84,6 +82,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     application.state.settings = settings
+    application.state.observability = Observability()
+    application.add_middleware(
+        ObservabilityMiddleware, observability=application.state.observability
+    )
     application.add_exception_handler(RequestValidationError, request_validation_error_handler)
     application.add_exception_handler(PlayerNotRankedError, player_not_ranked_handler)
     application.add_exception_handler(RedisError, redis_error_handler)

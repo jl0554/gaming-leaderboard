@@ -22,6 +22,7 @@ They are different when players tie.
 - Work inside the interview container under `/workspaces/gaming-leaderboard`.
   Keep code and runtime data out of the host Desktop and Downloads directories.
 - Python 3.12 or later; the Dockerfile and CI configuration use Python 3.14.
+- Dependency installs use the committed `uv.lock` with uv 0.12.18 (bootstrapped below).
 - Redis 7 or later. The integration tests require `redis-server` on `PATH`.
 - Docker with Compose is optional for running the service stack; a containerized IDE
   does not necessarily provide access to a Docker daemon.
@@ -35,13 +36,50 @@ sudo apt-get install -y redis-server
 
 ## Run locally
 
-Create the virtual environment and install the application and development tools:
+### Start or restart the interview demo
+
+After installing dependencies and configuring `.env`, use these commands in the
+**VS Code container terminal** (not a Mac terminal):
 
 ```sh
 cd /workspaces/gaming-leaderboard
-python3 -m venv .venv
+.venv/bin/python scripts/local.py start
+.venv/bin/python scripts/local.py status
+```
+
+The Linux-container helper starts Redis with AOF persistence in `.runtime/redis` and runs
+the API in the background with development reload enabled. Forward container port 8000
+using VS Code's Ports panel, then open `http://localhost:8000/docs`.
+
+Saving Python source under `src/` reloads the API automatically. After changing `.env`,
+configuration, or installed dependencies, restart just the API:
+
+```sh
+cd /workspaces/gaming-leaderboard
+.venv/bin/python scripts/local.py restart
+```
+
+For changed dependencies, sync the updated lockfile before restarting. Logs are in
+`.runtime/local/api.log` and `.runtime/local/redis.log`. `scripts/local.py stop` stops only
+the API; Redis keeps running. The helper checks process identity before stopping anything
+and refuses to take over occupied ports. Do not delete `.runtime/redis`: it holds scores.
+This helper is limited to a local, unauthenticated Redis database 0. It refuses a port
+change while its Redis is running; migrate endpoints/data deliberately instead of silently
+switching stores. Changing the key prefix also selects a different set of leaderboards.
+A commit/push alone does not restart anything. This is a workstation demo, not public
+production hosting, and it stops if the interview container stops.
+
+### First-time setup or manual foreground launch
+
+Install the pinned lock tool into its own environment, then install the locked project
+dependencies. Keeping the tool separate lets `uv sync` clean the application environment:
+
+```sh
+cd /workspaces/gaming-leaderboard
+python3 -m venv .runtime/uv
+.runtime/uv/bin/python -m pip install uv==0.12.18
+UV_CACHE_DIR="$PWD/.runtime/uv-cache" .runtime/uv/bin/uv sync --locked --extra dev
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
 cp -n .env.example .env
 mkdir -p .runtime/redis
 ```
@@ -81,12 +119,14 @@ Start the API in another terminal:
 ```sh
 cd /workspaces/gaming-leaderboard
 source .venv/bin/activate
-uvicorn leaderboard.main:app --reload
+uvicorn leaderboard.main:app --reload --no-access-log
 ```
 
 Open [interactive API documentation](http://localhost:8000/docs). Use **Authorize**, select
 `ScoreSubmissionKey`, and enter your local key to submit scores through Swagger UI.
-The documentation itself and all GET endpoints remain public. Check the process with `GET /health/live`; `GET /health/ready` also checks Redis.
+Documentation, leaderboard reads, and health checks remain public. `/metrics` is separately
+protected and disabled until configured. Check the process with `GET /health/live`;
+`GET /health/ready` also checks Redis.
 Stop foreground processes with Ctrl+C. Preserve `.runtime/redis` when restarting Redis.
 
 ## Run with Docker Compose
@@ -112,7 +152,7 @@ it to the API. A missing value prevents Compose startup.
 
 `POST /games/{game_id}/scores` requires the `X-API-Key` header. A missing or incorrect key
 returns `401` with `{"detail":"Invalid or missing API key"}`. Leaderboard/context GETs,
-health checks, `/docs`, and `/openapi.json` remain public.
+health checks, `/docs`, and `/openapi.json` remain public. `/metrics` requires its own key.
 
 The configured key must contain 32–256 printable ASCII characters with no whitespace; the generator
 above creates a suitable random value. Keep `.env` and the key out of Git and application
@@ -243,6 +283,9 @@ Settings load from environment variables or `.env`:
 
 - `LEADERBOARD_SUBMISSION_API_KEY`: required, with no default; 32–256 printable ASCII
   characters without whitespace. Missing or invalid configuration prevents API startup.
+- `LEADERBOARD_METRICS_API_KEY`: optional separate, read-only monitoring credential with
+  the same format requirements. Unset/empty disables `/metrics` (404). Configure a different
+  value from the submission key (equal keys are rejected); send it only in `X-Metrics-Key`.
 - `LEADERBOARD_REDIS_URL`: default `redis://localhost:6379/0`.
 - `LEADERBOARD_REDIS_KEY_PREFIX`: default `leaderboard`; change it to isolate deployments.
 - `LEADERBOARD_REDIS_CONNECT_TIMEOUT`: default 2 seconds.
@@ -253,6 +296,36 @@ Settings load from environment variables or `.env`:
 Redis connection and socket timeouts bound individual network operations. They are not
 an end-to-end HTTP request deadline. Automatic connection/timeout retries are disabled.
 Keep credentials out of Git; `.env` and local runtime data are ignored.
+
+## Request tracing and monitoring
+
+Each HTTP response includes a server-generated `X-Request-ID`. Use that ID to find the
+corresponding JSON log entry. Incoming request IDs are deliberately replaced. Logs include
+the timestamp, route pattern, method, status, and elapsed milliseconds. They omit raw URLs,
+query strings, headers, request bodies, actual game/player IDs, and exception messages.
+The documented launch command and Docker image disable Uvicorn's raw access log; launching
+without `--no-access-log` may additionally log raw paths and query strings.
+
+Redis failures are counted and logged as `connection`, `timeout`, `authentication`,
+`response`, or `other`, so a disconnected Redis is distinguishable from a script/configuration
+problem. Existing public 503 responses are unchanged. Unexpected errors return a generic
+500 `INTERNAL_ERROR` with a request ID; only the exception type is recorded, not its message
+or traceback. This deliberately trades detailed debugging context for safe default logs.
+
+After configuring a separate `LEADERBOARD_METRICS_API_KEY` and restarting the API,
+`GET /metrics` accepts `X-Metrics-Key` and exposes Prometheus-compatible metrics:
+
+- `leaderboard_http_requests_total`: counts by method, route pattern, and status.
+- `leaderboard_http_request_duration_seconds`: latency histogram in seconds.
+- `leaderboard_redis_errors_total`: failures by category and operation.
+
+Missing/wrong monitoring credentials return 401 when enabled. Monitoring keys do not grant
+write permission. Scrapes are excluded from request metrics/logs. Labels never include
+request IDs, raw paths, game IDs, or player IDs; unmatched paths share one `unmatched` label.
+These are **per-process** metrics: use one Uvicorn worker per container and scrape each
+replica separately. Counters reset on restart. No Prometheus server, dashboard, alerting,
+or Redis memory monitoring is deployed by this repository. Keep `/metrics` private behind
+your deployment gateway as well as protecting its credential.
 
 ## Tests and quality checks
 
@@ -274,12 +347,39 @@ Coverage includes highest-score updates and retries, shared ranks and cutoff tie
 context windows beginning inside a tied group, boundaries, strict validation, game
 isolation, concurrent submissions, and storage-failure responses. Storage resilience
 checks use dedicated Redis processes for outages, timeouts, recovery, and a normal
-restart with AOF persistence; these do not establish crash durability or verify a Docker
-deployment. Redis must be installed locally even when the API is run with Compose.
+restart with AOF persistence; these do not establish crash durability. Observability tests
+also cover credential isolation, secret-safe logs, bounded labels, failure categories,
+unexpected errors, and concurrent request IDs. Redis must be installed for pytest even
+when the development API is run with Compose.
 
-GitHub Actions explicitly installs Redis and the Python dependencies, then runs lint and
-the same pytest command shown above. Check the actual workflow result before submission;
-local test success alone does not prove CI or the Compose deployment has passed.
+GitHub Actions installs Redis and runs `uv sync --locked --extra dev`, lint, and pytest.
+A second job builds the Docker image from the same lockfile and starts a disposable Compose
+stack. `scripts/smoke.py` verifies readiness, authentication, best-score preservation,
+shared ranks, player context, request IDs, and protected metrics over real HTTP.
+
+To reproduce the Docker check on a machine with Docker Compose supporting `!reset`:
+
+```sh
+export LEADERBOARD_SUBMISSION_API_KEY=ci-only-submission-key-not-a-secret-0123456789
+export LEADERBOARD_METRICS_API_KEY=ci-only-metrics-key-not-a-secret-0123456789
+docker compose -p leaderboard-ci -f compose.yaml -f compose.ci.yaml up --build --wait --wait-timeout 90
+docker compose -p leaderboard-ci -f compose.yaml -f compose.ci.yaml exec -T api python - < scripts/smoke.py
+docker compose -p leaderboard-ci -f compose.yaml -f compose.ci.yaml down
+unset LEADERBOARD_SUBMISSION_API_KEY LEADERBOARD_METRICS_API_KEY
+```
+
+Run these commands in a separate test terminal. These are public **test-only** credentials.
+The override publishes no ports, attaches no persistent Redis volume, and disables Redis
+persistence. Cleanup discards only that test stack's ephemeral scores; it does not touch
+the development Redis volume. The smoke script refuses to run unless the environment is
+`test`. It is a deployment wiring check, not a load or durability test.
+
+To intentionally update dependencies, run `.runtime/uv/bin/uv lock --upgrade`, sync, review
+the lockfile diff, and rerun both test stages. `--locked` fails if project metadata and the
+lockfile disagree. Runtime/development dependency versions and hashes are locked; base OS
+image tags and isolated build-backend dependencies are not fully pinned, so builds are not
+claimed to be bit-for-bit reproducible. Check the actual GitHub workflow result before
+submission; local test success alone does not prove the remote workflow has passed.
 
 ## Project layout and architecture
 
@@ -289,7 +389,11 @@ local test success alone does not prove CI or the Compose deployment has passed.
 - `src/leaderboard/models.py`: validation and response models.
 - `src/leaderboard/storage.py`: Redis operations and atomic scripts.
 - `src/leaderboard/config.py`: environment-based settings.
+- `src/leaderboard/security.py`: separate score-submission and monitoring credentials.
+- `src/leaderboard/observability.py`: safe JSON logs, request IDs, and bounded metrics.
 - `tests/`: API, validation, concurrency, and storage integration checks.
+- `uv.lock`: resolved application/development dependency versions and hashes.
+- `scripts/smoke.py` and `compose.ci.yaml`: isolated packaged-application verification.
 - `docs/architecture.md`: request/data-flow diagram and design tradeoffs.
 
 See [the architecture diagram and design notes](docs/architecture.md) for atomic ranking

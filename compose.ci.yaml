@@ -1,0 +1,11 @@
+# Only use with the dedicated, disposable leaderboard-ci Compose project.
+services:
+  api:
+    image: gaming-leaderboard:ci
+    ports: !reset []
+    environment:
+      LEADERBOARD_ENVIRONMENT: test
+      LEADERBOARD_REDIS_KEY_PREFIX: smoke-test
+  redis:
+    volumes: !reset []
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
