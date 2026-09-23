@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    environment:
+      LEADERBOARD_ENVIRONMENT: development
+      LEADERBOARD_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  redis-data:
